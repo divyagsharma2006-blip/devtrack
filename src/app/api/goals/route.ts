@@ -2,6 +2,8 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { supabaseAdmin } from "@/lib/supabase";
 import { resolveAppUser } from "@/lib/resolve-user";
+import { dispatchToAllWebhooks } from "@/lib/webhooks";
+import { stripHtml } from "@/lib/sanitize";
 
 export const dynamic = "force-dynamic";
 
@@ -13,6 +15,7 @@ interface Goal {
   current: number;
   unit: string;
   recurrence: string;
+  deadline: string | null;
   period_start: string | null;
   created_at: string;
 }
@@ -25,13 +28,12 @@ const MAX_UNIT_LEN = 30;
 const MIN_TARGET = 1;
 const MAX_TARGET = 10_000;
 
+// Hard cap to prevent storage exhaustion and catastrophic Promise.all execution
+const MAX_GOALS_PER_USER = 5;
+
 function getPeriodStart(recurrence: Recurrence): string {
   const now = new Date();
   if (recurrence === "weekly") {
-    // Use UTC methods so the Monday boundary is the same regardless of the
-    // server's local timezone. getDay() / setDate() / setHours() all operate
-    // in local time, which can push the reset boundary a day early or late
-    // on servers that are not running in UTC.
     const day = now.getUTCDay();
     const diff = day === 0 ? -6 : 1 - day; // Monday
     const monday = new Date(now);
@@ -40,8 +42,6 @@ function getPeriodStart(recurrence: Recurrence): string {
     return monday.toISOString();
   }
   if (recurrence === "monthly") {
-    // Date.UTC avoids the local-timezone offset that the Date constructor
-    // applies when month/day/hour arguments are passed directly.
     return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
   }
   return new Date(0).toISOString(); // 'none' never resets
@@ -53,14 +53,17 @@ export async function GET() {
     return Response.json({ error: "Unauthorized" }, { status: 401 });
   }
 
+
   const user = await resolveAppUser(session.githubId, session.githubLogin);
   if (!user) return Response.json({ error: "User not found" }, { status: 404 });
 
+  // Added .limit() to bound the database payload and the subsequent Promise.all loop
   const { data: goals } = await supabaseAdmin
     .from("goals")
     .select("*")
     .eq("user_id", user.id)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .limit(MAX_GOALS_PER_USER);
 
   // Reset progress if we're in a new period
   const processedGoals = await Promise.all(
@@ -73,12 +76,6 @@ export async function GET() {
         : new Date(0);
 
       if (storedPeriodStart < periodStart) {
-        // Use a conditional update that only succeeds when the DB row still
-        // has the old period_start. If two concurrent GET requests both see
-        // a stale period_start and race to reset the goal, only one update
-        // will match the lt() filter — the second finds no row and returns
-        // null, after which we re-fetch the already-reset row to avoid
-        // silently zeroing out any progress written between the two reads.
         const { data: updated } = await supabaseAdmin
           .from("goals")
           .update({ current: 0, period_start: periodStart.toISOString() })
@@ -89,8 +86,6 @@ export async function GET() {
 
         if (updated) return updated;
 
-        // Another concurrent request already reset this goal — re-fetch
-        // the current state so we return accurate data without clobbering it.
         const { data: current } = await supabaseAdmin
           .from("goals")
           .select("*")
@@ -113,22 +108,28 @@ export async function POST(req: Request) {
   }
 
   let body: unknown;
-  try {
-    body = await req.json();
-  } catch {
-    return Response.json({ error: "Invalid JSON" }, { status: 400 });
-  }
+
+try {
+  body = await req.json();
+} catch {
+  return Response.json({ error: "Invalid JSON" }, { status: 400 });
+}
+
 
   if (typeof body !== "object" || body === null) {
     return Response.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { title, target, unit, recurrence } = body as Record<string, unknown>;
+  const { title, target, unit, recurrence, deadline } = body as Record<string, unknown>;
 
   if (typeof title !== "string" || title.trim().length === 0) {
     return Response.json({ error: "title must be a non-empty string" }, { status: 400 });
   }
-  if (title.length > MAX_TITLE_LEN) {
+  const sanitizedTitle = stripHtml(title);
+  if (sanitizedTitle.length === 0) {
+    return Response.json({ error: "title must not be empty" }, { status: 400 });
+  }
+  if (sanitizedTitle.length > MAX_TITLE_LEN) {
     return Response.json({ error: `title must be ${MAX_TITLE_LEN} characters or fewer` }, { status: 400 });
   }
   if (
@@ -148,24 +149,59 @@ export async function POST(req: Request) {
     ? (recurrence as Recurrence)
     : "none";
 
+  let safeDeadline: string | null = null;
+  if (typeof deadline === "string") {
+    const d = new Date(deadline);
+    if (!isNaN(d.getTime())) {
+      d.setUTCHours(23, 59, 59, 999);
+      safeDeadline = d.toISOString();
+    }
+  }
+
   const user = await resolveAppUser(session.githubId, session.githubLogin);
   if (!user) return Response.json({ error: "User not found" }, { status: 404 });
+
+  // Pre-check count query using head option for peak performance
+  const { count, error: countError } = await supabaseAdmin
+    .from("goals")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", user.id);
+
+  if (countError) {
+    return Response.json({ error: "Failed to verify goal limits" }, { status: 500 });
+  }
+
+  if ((count ?? 0) >= MAX_GOALS_PER_USER) {
+    return Response.json(
+      { error: `You can have at most ${MAX_GOALS_PER_USER} goals.` },
+      { status: 400 }
+    );
+  }
 
   const { data: goal, error } = await supabaseAdmin
     .from("goals")
     .insert({
       user_id: user.id,
-      title: title.trim(),
+      title: sanitizedTitle,
       target,
       unit: safeUnit,
       recurrence: safeRecurrence,
       period_start: getPeriodStart(safeRecurrence),
+      deadline: safeDeadline,
       current: 0,
     })
     .select()
     .single();
 
   if (error) return Response.json({ error: error.message }, { status: 500 });
+
+  dispatchToAllWebhooks(user.id, "goal.created", {
+    goalId: goal.id,
+    title: goal.title,
+    target: goal.target,
+    unit: goal.unit,
+    recurrence: goal.recurrence,
+  }).catch(() => {});
 
   return Response.json({ goal }, { status: 201 });
 }

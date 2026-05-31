@@ -51,7 +51,7 @@ function extractImports(src) {
   // Strip single-line and multi-line comments to prevent quotes inside comments from throwing off the regex
   const cleanSrc = src
     .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/\/\/.*/g, "");
+    .replace(/(^|[^:])\/\/.*$/gm, "$1");
 
   for (const re of [IMPORT_RE, SIDE_EFFECT_IMPORT_RE, DYNAMIC_RE]) {
     re.lastIndex = 0;
@@ -63,17 +63,47 @@ function extractImports(src) {
 
   return imports;
 }
+function loadInternalAliases(rootDir) {
+  const aliases = ["@/", "~/", "src/"];
 
+  const configFiles = ["tsconfig.json", "jsconfig.json"];
+
+  for (const file of configFiles) {
+    const configPath = path.join(rootDir, file);
+
+    if (!fs.existsSync(configPath)) continue;
+
+    try {
+      const config = JSON.parse(
+        fs.readFileSync(configPath, "utf8")
+      );
+
+      const paths = config.compilerOptions?.paths || {};
+
+      for (const key of Object.keys(paths)) {
+        aliases.push(
+          key.replace(/\*.*$/, "")
+        );
+      }
+    } catch (err) {
+      console.warn(
+        `Warning: Failed to parse ${file}`
+      );
+    }
+  }
+
+  return aliases;
+}
 function collectMissingDeps(files, allDeps, cwd = process.cwd()) {
   const missing = new Map(); // pkgName → Set of files
+  // Load Aliases 
+  const INTERNAL_ALIASES = loadInternalAliases(cwd);
 
   for (const file of files) {
     const src = fs.readFileSync(file, "utf8");
     const rel = path.relative(cwd, file).replace(/\\/g, "/");
 
     for (const mod of extractImports(src)) {
-      // Skip relative imports, path aliases (@/ is the src alias — not a pkg)
-      const INTERNAL_ALIASES = ["@/", "~/", "src/"];
       if (
         mod.startsWith(".") || 
         mod.startsWith("/") || 
@@ -82,7 +112,17 @@ function collectMissingDeps(files, allDeps, cwd = process.cwd()) {
         continue;
       }
       const pkgName = extractPackageName(mod);
-      if (BUILTINS.has(pkgName) || FRAMEWORK_ALIASES.has(pkgName)) continue;
+
+      const normalizedPkg = pkgName.startsWith("node:")
+        ? pkgName.slice(5)
+        : pkgName;
+
+      if (
+        BUILTINS.has(normalizedPkg) ||
+        FRAMEWORK_ALIASES.has(normalizedPkg)
+      ) {
+        continue;
+      }
       if (allDeps.has(pkgName)) continue;
 
       if (!missing.has(pkgName)) missing.set(pkgName, new Set());
